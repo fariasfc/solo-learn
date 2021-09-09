@@ -234,6 +234,7 @@ def prepare_dataloaders(
 
 def prepare_data(
     dataset: str,
+    transform: Optional[Callable] = None,
     data_dir: Optional[Union[str, Path]] = None,
     train_dir: Optional[Union[str, Path]] = None,
     val_dir: Optional[Union[str, Path]] = None,
@@ -257,7 +258,12 @@ def prepare_data(
         Tuple[DataLoader, DataLoader]: prepared training and validation dataloader;.
     """
 
-    T_train, T_val = prepare_transforms(dataset)
+    if transform is None:
+        T_train, T_val = prepare_transforms(dataset)
+    else:
+        T_train = transform
+        T_val = transform
+
     train_dataset, val_dataset = prepare_datasets(
         dataset,
         T_train,

@@ -1,8 +1,15 @@
 import os
+import sys
+sys.path.append('/datadrive/solo-learn/')
 from pprint import pprint
+from torch import nn
+import torch
+import torch.nn.functional as F
 
+import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor
+from pytorch_lightning.callbacks.base import Callback
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins import DDPPlugin
 
@@ -32,6 +39,44 @@ from solo.utils.pretrain_dataloader import (
     prepare_n_crop_transform,
     prepare_transform,
 )
+
+class LatentMetricsCallback(Callback):
+    def __init__(self, wandb_logger) -> None:
+        super().__init__()
+        self.wandb_logger = wandb_logger
+
+    def align_loss(x, y, alpha=2, normalized=False):
+        """
+        calculate alignment metric from embedding pairs
+        """
+        if normalized:
+            x = F.normalize(x, p=2, dim=1)
+            y = F.normalize(y, p=2, dim=1)
+        return (x - y).norm(p=2, dim=1).pow(alpha).mean()
+
+
+    def cos_dist_loss(x, y):
+        """
+        calculate alignment metric (cosine distance) from embedding pairs. 0: perfect alignment, 1: perpendicular, 2: opposite
+        """
+        # cos_similarity = (x * y).sum(-1) / (torch.norm(x, p=2, dim=1) * torch.norm(y, p=2, dim=1))
+        cos_similarity = nn.CosineSimilarity()(x, y).mean()
+        return 1 - cos_similarity
+
+    def uniform_loss(x, t=2, normalized=False):
+        """
+        calculate uniformity metric from embeddings (not including augmented counterparts)
+        """
+        if normalized:
+            x = F.normalize(x, p=2, dim=1)
+        return torch.pdist(x, p=2).pow(2).mul(-t).exp().mean().log()
+
+    # def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    #     metrics = {
+    #         "align":
+    #     }
+    #     self.wandb_logger.log_metrics()
+    #     return super().on_validation_epoch_end(trainer, pl_module)
 
 
 def main():
@@ -106,6 +151,7 @@ def main():
     else:
         _, val_loader = prepare_data_classification(
             args.dataset,
+            transform=transform,
             data_dir=args.data_dir,
             train_dir=args.train_dir,
             val_dir=args.val_dir,
@@ -148,6 +194,8 @@ def main():
                 frequency=args.auto_umap_frequency,
             )
             callbacks.append(auto_umap)
+
+        # callbacks.append(LatentMetricsCallback(wandb_logger))
 
     trainer = Trainer.from_argparse_args(
         args,

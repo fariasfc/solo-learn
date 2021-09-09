@@ -402,6 +402,7 @@ class BaseModel(pl.LightningModule):
 
         metrics = {
             "batch_size": batch_size,
+            "feats": out["feats"],
             "val_loss": out["loss"],
             "val_acc1": out["acc1"],
             "val_acc5": out["acc5"],

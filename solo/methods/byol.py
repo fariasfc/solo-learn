@@ -1,5 +1,7 @@
 import argparse
 from typing import Any, Dict, List, Sequence, Tuple
+from solo.utils.metrics import accuracy_at_k, weighted_mean
+from copy import deepcopy, copy
 
 import torch
 import torch.nn as nn
@@ -8,6 +10,7 @@ from solo.losses.byol import byol_loss_func
 from solo.methods.base import BaseMomentumModel
 from solo.utils.momentum import initialize_momentum_params
 
+from solo import metrics_utils
 
 class BYOL(BaseMomentumModel):
     def __init__(
@@ -148,3 +151,110 @@ class BYOL(BaseMomentumModel):
         self.log_dict(metrics, on_epoch=True, sync_dist=True)
 
         return neg_cos_sim + class_loss
+
+    def validation_step(
+        self, batch: List[torch.Tensor], batch_idx: int
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Validation step for pytorch lightning. It performs all the shared operations for the
+        momentum encoder and classifier, such as forwarding a batch of images in the momentum
+        encoder and classifier and computing statistics.
+
+        Args:
+            batch (List[torch.Tensor]): a batch of data in the format of [X, Y].
+            batch_idx (int): index of the batch.
+
+        Returns:
+            Tuple(Dict[str, Any], Dict[str, Any]): tuple of dicts containing the batch_size (used
+                for averaging), the classification loss and accuracies for both the online and the
+                momentum classifiers.
+        """
+        batch2 = copy(batch)
+        batch[0] = batch[0][0]
+        batch2[0] = batch2[0][1]
+
+        
+        parent_metrics, metrics = super().validation_step(batch, batch_idx)
+        parent_metrics2, metrics2 = super().validation_step(batch2, batch_idx)
+        feats1 = parent_metrics['feats']
+        feats2 = parent_metrics2['feats']
+
+        # momentum_outs = [self._shared_step_momentum(b[0], b[1]) for b in [batch, batch2]]
+        # momentum_feats1, momentum_feats2 = momentum_outs[0]['feats'], momentum_outs[1]['feats']
+
+        with torch.no_grad():
+            z1 = self.projector(feats1)
+            z2 = self.projector(feats2)
+            p1 = self.predictor(z1)
+            p2 = self.predictor(z2)
+
+            # # forward momentum encoder
+            # z1_momentum = self.momentum_projector(momentum_feats1)
+            # z2_momentum = self.momentum_projector(momentum_feats2)
+
+        X, targets = batch
+        batch_size = targets.size(0)
+
+        metrics_utils.align_loss(p1, p2)
+        latent_metrics = {
+            "our_alignment": metrics_utils.align_loss(p1, p2),
+            "our_normalized_alignment": metrics_utils.align_loss(p1, p2, normalized=True),
+            "our_cosine_distance": metrics_utils.cos_dist_loss(p1, p2),
+            "our_uniformity": metrics_utils.uniform_loss(p1),
+            "our_normalized_uniformity": metrics_utils.uniform_loss(p1, normalized=True)
+        }
+        if metrics is not None:
+            metrics = {**metrics, **latent_metrics}
+        else:
+            metrics = latent_metrics
+
+        metrics["batch_size"] = batch_size
+
+        out = self._shared_step_momentum(X, targets)
+        # out = momentum_outs[0]
+
+        if self.momentum_classifier is not None:
+            metrics = {
+                "momentum_val_loss": out["loss"],
+                "momentum_val_acc1": out["acc1"],
+                "momentum_val_acc5": out["acc5"],
+            }
+
+        return parent_metrics, metrics
+
+    def validation_epoch_end(self, outs: Tuple[List[Dict[str, Any]]]):
+        """Averages the losses and accuracies of the momentum encoder / classifier for all the
+        validation batches. This is needed because the last batch can be smaller than the others,
+        slightly skewing the metrics.
+
+        Args:
+            outs (Tuple[List[Dict[str, Any]]]):): list of outputs of the validation step for self
+                and the parent.
+        """
+
+        parent_outs = [out[0] for out in outs]
+        super().validation_epoch_end(outs)
+        # online_predictions = parent_outs['logits']
+        # target_projections = parent_outs['target_projections']
+        momentum_outs = [out[1] for out in outs]
+        log = {
+            "our_alignment": weighted_mean(momentum_outs, "our_alignment", "batch_size"),
+            "our_normalized_alignment": weighted_mean(momentum_outs, "our_normalized_alignment", "batch_size"),
+            "our_uniformity": weighted_mean(momentum_outs, "our_uniformity", "batch_size"),
+            "our_normalized_uniformity": weighted_mean(momentum_outs, "our_normalized_uniformity", "batch_size"),
+            "our_cosine_distance": weighted_mean(momentum_outs, "our_cosine_distance", "batch_size"),
+        }
+
+        self.log_dict(log, sync_dist=True)
+
+        if self.momentum_classifier is not None:
+
+            val_loss = weighted_mean(momentum_outs, "momentum_val_loss", "batch_size")
+            val_acc1 = weighted_mean(momentum_outs, "momentum_val_acc1", "batch_size")
+            val_acc5 = weighted_mean(momentum_outs, "momentum_val_acc5", "batch_size")
+
+            log = {
+                "momentum_val_loss": val_loss,
+                "momentum_val_acc1": val_acc1,
+                "momentum_val_acc5": val_acc5,
+            }
+            self.log_dict(log, sync_dist=True)
